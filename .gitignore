@@ -70,4 +70,4 @@ build/
 # Results and data (optional - uncomment to ignore)
 # --------------------
 # results/
-# *.hdf5
+*.hdf5
