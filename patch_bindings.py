@@ -11,7 +11,7 @@ def patch():
 
     # Add set_tahnsw_config to the Index class
     set_config_cpp = """
-    void set_tahnsw_config(float cluster_high_thresh, float cluster_low_thresh, float M_alpha, float M_beta, int M_min, int sketch_width, int sketch_depth, int sketch_S, bool prune_layer0_only, bool prune_angle_check, float prune_angle_deg, int k_candidates, int b_max_window) {
+    void set_tahnsw_config(float cluster_high_thresh, float cluster_low_thresh, float M_alpha, float M_beta, int M_min, int sketch_width, int sketch_depth, int sketch_S, bool prune_layer0_only, bool prune_angle_check, float prune_angle_deg, int k_candidates, int b_max_window, bool fast_construction, float cluster_radius_mult, float heuristic_alpha) {
         if (!appr_alg) throw std::runtime_error("Index not initiated");
         tahnsw::TAHNSWConfig cfg;
         cfg.cluster_high_thresh = cluster_high_thresh;
@@ -27,9 +27,12 @@ def patch():
         cfg.prune_angle_deg = prune_angle_deg;
         cfg.k_candidates = k_candidates;
         cfg.b_max_window = b_max_window;
+        cfg.fast_construction = fast_construction;
+        cfg.cluster_radius_mult = cluster_radius_mult;
+        cfg.heuristic_alpha = heuristic_alpha;
         appr_alg->set_tahnsw_config(cfg, l2space);
     }
-    
+
     py::dict get_tahnsw_stats() {
         if (!appr_alg) return py::dict();
         return py::dict(
@@ -37,8 +40,26 @@ def patch():
             "leaf_count"_a = appr_alg->tahnsw_leaf_count.load(),
             "mid_count"_a = appr_alg->tahnsw_mid_count.load(),
             "edges_saved"_a = appr_alg->tahnsw_edges_saved.load(),
-            "edges_baseline"_a = appr_alg->tahnsw_edges_baseline.load()
+            "edges_baseline"_a = appr_alg->tahnsw_edges_baseline.load(),
+            "search_calls"_a = appr_alg->tahnsw_search_calls.load(),
+            "dist_comps"_a = appr_alg->metric_distance_computations.load(),
+            "hops"_a = appr_alg->metric_hops.load()
         );
+    }
+
+    void reset_metrics() {
+        if (!appr_alg) return;
+        appr_alg->metric_distance_computations = 0;
+        appr_alg->metric_hops = 0;
+    }
+
+    void build_search_seeds(int n_hub_seeds) {
+        if (!appr_alg) throw std::runtime_error("Index not initiated");
+        appr_alg->build_search_seeds(n_hub_seeds);
+    }
+
+    void clear_search_seeds() {
+        if (appr_alg) appr_alg->tahnsw_search_seeds_.clear();
     }
     """
 
@@ -59,9 +80,15 @@ def patch():
              py::arg("prune_layer0_only")=true, 
              py::arg("prune_angle_check")=false, 
              py::arg("prune_angle_deg")=60.0f, 
-             py::arg("k_candidates")=20, 
-             py::arg("b_max_window")=5000)
+             py::arg("k_candidates")=20,
+             py::arg("b_max_window")=5000,
+             py::arg("fast_construction")=true,
+             py::arg("cluster_radius_mult")=1.0f,
+             py::arg("heuristic_alpha")=1.0f)
         .def("get_tahnsw_stats", &Index<float>::get_tahnsw_stats)
+        .def("reset_metrics", &Index<float>::reset_metrics)
+        .def("build_search_seeds", &Index<float>::build_search_seeds, py::arg("n_hub_seeds")=6)
+        .def("clear_search_seeds", &Index<float>::clear_search_seeds)
 """
     content = content.replace('.def("set_ef", &Index<float>::set_ef, py::arg("ef"))', bind_code)
 

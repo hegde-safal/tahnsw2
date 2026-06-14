@@ -80,7 +80,48 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> tahnsw_mid_count{0};
     mutable std::atomic<long> tahnsw_edges_saved{0};
     mutable std::atomic<long> tahnsw_edges_baseline{0};
+    mutable std::atomic<long> tahnsw_search_calls{0};   // DIAG: searchBaseLayer invocations
     std::vector<int> tahnsw_m_values_;
+
+    // Topology-aware SEARCH: extra level-0 entry seeds (medoid + centrality hubs).
+    std::vector<tableint> tahnsw_search_seeds_;
+
+    // Build the search seeds: the medoid (node nearest the global centroid) plus
+    // the top n_hub_seeds nodes by estimated centrality. Call once after add_items.
+    void build_search_seeds(int n_hub_seeds = 6) {
+        tahnsw_search_seeds_.clear();
+        size_t n = cur_element_count;
+        if (n == 0) return;
+        size_t dim = data_size_ / sizeof(float);
+
+        // 1) medoid: centroid of all stored vectors, then the nearest node to it.
+        std::vector<float> centroid(dim, 0.0f);
+        for (size_t i = 0; i < n; i++) {
+            const float* v = (const float*)getDataByInternalId((tableint)i);
+            for (size_t d = 0; d < dim; d++) centroid[d] += v[d];
+        }
+        for (size_t d = 0; d < dim; d++) centroid[d] /= (float)n;
+        tableint medoid = 0; dist_t best = std::numeric_limits<dist_t>::max();
+        for (size_t i = 0; i < n; i++) {
+            dist_t d = fstdistfunc_(centroid.data(), getDataByInternalId((tableint)i), dist_func_param_);
+            if (d < best) { best = d; medoid = (tableint)i; }
+        }
+        tahnsw_search_seeds_.push_back(medoid);
+
+        // 2) top centrality hubs from the sketch (if topology was used during build).
+        if (topology_analyser && n_hub_seeds > 0) {
+            std::vector<std::pair<float, tableint>> cent;
+            cent.reserve(n);
+            for (size_t i = 0; i < n; i++)
+                cent.emplace_back(topology_analyser->get_normalised_centrality((int)i), (tableint)i);
+            int take = std::min((int)n, n_hub_seeds);
+            std::partial_sort(cent.begin(), cent.begin() + take, cent.end(),
+                              [](auto& a, auto& b){ return a.first > b.first; });
+            for (int i = 0; i < take; i++)
+                if (cent[i].second != medoid)
+                    tahnsw_search_seeds_.push_back(cent[i].second);
+        }
+    }
 
     void set_tahnsw_config(const tahnsw::TAHNSWConfig& cfg, SpaceInterface<dist_t> *s) {
         if (cur_element_count > 0) {
@@ -92,8 +133,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         adaptive_degree.reset(new tahnsw::AdaptiveDegree(tahnsw_cfg));
         rng_pruner.reset(new tahnsw::RNGPruner<dist_t>(tahnsw_cfg, s));
         
-        // Inflate M to accommodate alpha-scaled connections
-        int M_max = static_cast<int>(M_ * tahnsw_cfg.M_alpha) + 2;
+        // Inflate M to accommodate alpha-scaled connections. AdaptiveDegree can
+        // return up to round(M * alpha * 1.2) for a high-centrality hub, so the
+        // storage cap must cover that or the forward link list overflows.
+        int M_max = static_cast<int>(std::ceil(M_ * tahnsw_cfg.M_alpha * 1.2f)) + 2;
         maxM_ = M_max;
         maxM0_ = M_max * 2;
         
@@ -269,6 +312,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer) {
+        tahnsw_search_calls++;
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -358,7 +402,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const void *data_point,
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
-        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr,
+        const std::vector<tableint>* extra_seeds = nullptr) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -383,6 +428,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_array[ep_id] = visited_array_tag;
+
+        // Topology-aware search: seed the level-0 frontier with extra entry points
+        // (medoid + high-centrality hubs). Diverse starting points can cut the hop
+        // count to reach a given recall. Only used at the base layer (bare_bone).
+        if (extra_seeds) {
+            if (collect_metrics) metric_distance_computations += (long)extra_seeds->size();
+            for (tableint s : *extra_seeds) {
+                if (visited_array[s] == visited_array_tag) continue;
+                visited_array[s] = visited_array_tag;
+                dist_t d = fstdistfunc_(data_point, getDataByInternalId(s), dist_func_param_);
+                if (top_candidates.size() < ef || d < lowerBound) {
+                    candidate_set.emplace(-d, s);
+                    if (bare_bone_search || !isMarkedDeleted(s))
+                        top_candidates.emplace(d, s);
+                    if (top_candidates.size() > ef) top_candidates.pop();
+                    if (!top_candidates.empty()) lowerBound = top_candidates.top().first;
+                }
+            }
+        }
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -492,6 +556,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return;
         }
 
+        // alpha for RobustPrune-style selection (Vamana/DiskANN). alpha=1.0 is the
+        // stock HNSW RNG heuristic. alpha>1 relaxes the domination test so more
+        // diverse/long-range edges survive (denser, more navigable graph).
+        const dist_t alpha = static_cast<dist_t>(tahnsw_cfg.heuristic_alpha);
+
         std::priority_queue<std::pair<dist_t, tableint>> queue_closest;
         std::vector<std::pair<dist_t, tableint>> return_list;
         while (top_candidates.size() > 0) {
@@ -512,7 +581,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         fstdistfunc_(getDataByInternalId(second_pair.second),
                                         getDataByInternalId(curent_pair.second),
                                         dist_func_param_);
-                if (curdist < dist_to_query) {
+                if (curdist * alpha < dist_to_query) {
                     good = false;
                     break;
                 }
@@ -565,6 +634,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             selectedNeighbors.push_back(top_candidates.top().second);
             top_candidates.pop();
         }
+
+        // Guard: with no candidates there is nothing to connect (can happen at a
+        // sparsely populated upper level). Returning cur_c keeps the descent valid
+        // and avoids undefined behaviour from selectedNeighbors.back() on empty.
+        if (selectedNeighbors.empty())
+            return cur_c;
 
         tableint next_closest_entry_point = selectedNeighbors.back();
 
@@ -626,9 +701,23 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
 
+            // OPT(search): cap this neighbor's reverse-degree at its own topology
+            // budget (2*M_eff at level 0, M_eff above) rather than the globally
+            // inflated maxM0_. Leaf/normal nodes stay sparse → fewer neighbors to
+            // scan per hop → faster search; only genuine hubs keep a high degree.
+            size_t Mcurmax_other = Mcurmax;
+            if (topology_analyser && tahnsw_cfg.fast_construction) {
+                int mv = tahnsw_m_values_[selectedNeighbors[idx]];
+                size_t budget = level ? (size_t)mv : (size_t)(2 * mv);
+                size_t floor_deg = (size_t)M_;          // never shrink below base M
+                if (budget < floor_deg) budget = floor_deg;
+                if (budget > Mcurmax) budget = Mcurmax;  // never exceed storage
+                Mcurmax_other = budget;
+            }
+
             // If cur_c is already present in the neighboring connections of `selectedNeighbors[idx]` then no need to modify any connections or run the heuristics.
             if (!is_cur_c_present) {
-                if (sz_link_list_other < Mcurmax) {
+                if (sz_link_list_other < Mcurmax_other) {
                     data[sz_link_list_other] = cur_c;
                     setListCount(ll_other, sz_link_list_other + 1);
                 } else {
@@ -645,7 +734,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                                 dist_func_param_), data[j]);
                     }
 
-                    getNeighborsByHeuristic2(candidates, Mcurmax);
+                    getNeighborsByHeuristic2(candidates, Mcurmax_other);
 
                     int indx = 0;
                     while (candidates.size() > 0) {
@@ -1296,7 +1385,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             
             curlevel = layer_assigner->assign(C_v, B_v_norm, cur_element_count, M_, max_layer_allowed, random_val);
             M_eff = adaptive_degree->compute_M(C_v, B_v_norm, M_);
-            
+            if (M_eff > (int)maxM_) M_eff = (int)maxM_;   // never exceed link storage
+
             if (C_v < tahnsw_cfg.cluster_low_thresh) {
                 tahnsw_hub_count++;
             } else if (C_v > tahnsw_cfg.cluster_high_thresh) {
@@ -1336,8 +1426,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel + 1);
         }
 
+        // OPT(build): the topology pre-pass already performed the greedy descent
+        // and a full level-0 search to compute C(v)/centrality. Reuse those
+        // candidates here instead of repeating a second full searchBaseLayer.
+        bool reuse_level0 = tahnsw_cfg.fast_construction && topology_analyser && !candidates_for_prune.empty();
+
         if ((signed)currObj != -1) {
-            if (curlevel < maxlevelcopy) {
+            // The upper-level descent only exists to seed searches at levels >= 1.
+            // If this node lives only on level 0 and we are reusing the pre-pass
+            // candidates, the descent is pure redundant work — skip it.
+            if (curlevel < maxlevelcopy && !(reuse_level0 && curlevel == 0)) {
                 dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
                 for (int level = maxlevelcopy; level > curlevel; level--) {
                     bool changed = true;
@@ -1369,8 +1467,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
 
-                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
-                        currObj, data_point, level);
+                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+                if (level == 0 && reuse_level0) {
+                    // OPT(build): reuse the level-0 neighborhood already gathered by
+                    // the topology pre-pass instead of a second full searchBaseLayer.
+                    for (const auto& c : candidates_for_prune)
+                        top_candidates.emplace(c.first, c.second);
+                } else {
+                    top_candidates = searchBaseLayer(currObj, data_point, level);
+                }
                 if (epDeleted) {
                     top_candidates.emplace(fstdistfunc_(data_point, getDataByInternalId(enterpoint_copy), dist_func_param_), enterpoint_copy);
                     if (top_candidates.size() > ef_construction_)
@@ -1453,12 +1558,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        const std::vector<tableint>* seeds = tahnsw_search_seeds_.empty() ? nullptr : &tahnsw_search_seeds_;
         if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+            top_candidates = searchBaseLayerST<true, true>(
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, seeds);
         } else {
-            top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+            top_candidates = searchBaseLayerST<false, true>(
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, seeds);
         }
 
         while (top_candidates.size() > k) {

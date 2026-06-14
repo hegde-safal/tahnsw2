@@ -42,6 +42,23 @@ struct TAHNSWConfig {
     
     int k_candidates = 20;
     int b_max_window = 5000;
+
+    // Neighbourhood-radius multiplier for the clustering coefficient C(v):
+    // an edge between two neighbours counts if their distance < mult * mean(d to query).
+    float cluster_radius_mult = 1.0f;
+
+    // alpha for the neighbour-selection heuristic (DiskANN/Vamana RobustPrune).
+    // A candidate c is dropped if an accepted neighbour w has alpha*d(w,c) < d(query,c).
+    // alpha=1.0 == stock HNSW RNG heuristic; alpha>1 keeps more diverse/long-range
+    // edges (denser, more navigable); alpha<1 prunes harder (sparser).
+    float heuristic_alpha = 1.0f;
+
+    // When true (default) the optimized construction path is used:
+    //   - reuse the topology pre-pass candidates instead of a 2nd level-0 search
+    //   - keep HNSW's exponential layer distribution (no level>=1 floor)
+    //   - cap reverse-link degree per node instead of the inflated global maxM0_
+    // Set false to reproduce the original (slow) construction for A/B benchmarks.
+    bool fast_construction = true;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,27 +144,30 @@ public:
         int possible = k * (k - 1) / 2;
         if (possible == 0) return 0.5f;
 
-        std::vector<dist_t> pair_dists;
-        pair_dists.reserve(possible);
-
-        for (int i = 0; i < k; ++i) {
-            for (int j = i + 1; j < k; ++j) {
-                char* data_i = index->getDataByInternalId(candidates[i].second);
-                char* data_j = index->getDataByInternalId(candidates[j].second);
-                dist_t d = space->get_dist_func()(data_i, data_j, space->get_dist_func_param());
-                pair_dists.push_back(d);
-            }
-        }
-
-        if (pair_dists.empty()) return 0.5f;
-
-        std::vector<dist_t> sorted_dists = pair_dists;
-        std::nth_element(sorted_dists.begin(), sorted_dists.begin() + sorted_dists.size() / 2, sorted_dists.end());
-        dist_t threshold = sorted_dists[sorted_dists.size() / 2];
+        // Scale = the neighbourhood radius, taken from the query→candidate
+        // distances the caller already computed (candidates[i].first). Using an
+        // ABSOLUTE scale is the whole point: the previous version thresholded on
+        // the median of the candidate-pair distances, which by construction makes
+        // ~half the pairs "edges" → C(v) ≈ 0.5 for EVERY node (no signal).
+        //
+        // Two neighbours are "connected" if they sit within the neighbourhood
+        // radius of each other. A tight cluster (leaf) → most pairs connected →
+        // C(v)→1. A bridge spanning clusters (hub) → cross pairs far apart →
+        // C(v)→0. The radius scales by cfg.cluster_radius_mult (tunable).
+        dist_t mean_q = 0;
+        for (int i = 0; i < k; ++i) mean_q += candidates[i].first;
+        mean_q /= static_cast<dist_t>(k);
+        if (mean_q <= 0) return 0.5f;
+        dist_t threshold = mean_q * static_cast<dist_t>(cfg.cluster_radius_mult);
 
         int edges = 0;
-        for (dist_t d : pair_dists) {
-            if (d < threshold) edges++;
+        for (int i = 0; i < k; ++i) {
+            char* data_i = index->getDataByInternalId(candidates[i].second);
+            for (int j = i + 1; j < k; ++j) {
+                char* data_j = index->getDataByInternalId(candidates[j].second);
+                dist_t d = space->get_dist_func()(data_i, data_j, space->get_dist_func_param());
+                if (d < threshold) edges++;
+            }
         }
 
         return static_cast<float>(edges) / possible;
@@ -210,8 +230,17 @@ public:
 
         float hub_score = 1.0f - C_v;
         float boost_factor = 1.0f + 0.4f * hub_score + 0.3f * B_v_norm;
-        int adjusted = std::max(1, static_cast<int>(base_level * boost_factor));
-        
+        // OPT(build+search): keep HNSW's exponential layer distribution. The old
+        // std::max(1, ...) floor forced EVERY mid node to level >= 1, so ~100% of
+        // nodes ended up in the upper layers (vs ~1/ln(M) in real HNSW). That made
+        // each insert run a full search at level 1 too, and bloated the hierarchy.
+        // A base_level draw of 0 (the common case) must stay at level 0; the
+        // topology boost only lifts nodes that already drew a higher level.
+        // (Legacy path keeps the old std::max(1,...) floor for A/B comparison.)
+        int adjusted = cfg.fast_construction
+            ? static_cast<int>(base_level * boost_factor)
+            : std::max(1, static_cast<int>(base_level * boost_factor));
+
         return std::min(max_layer, adjusted);
     }
 };
