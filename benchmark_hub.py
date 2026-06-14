@@ -14,7 +14,7 @@ import numpy as np
 import h5py, tahnsw_cpp
 
 DATA, N_BASE, N_QRY, K, M, EFC = "data_real/glove-100-angular.hdf5", 100000, 1000, 10, 16, 200
-EFS = [10, 15, 20, 30, 40, 60, 100, 150, 250, 400]
+EFS = [10, 15, 20, 30, 40, 60, 100, 150, 250, 400, 600, 900]
 
 
 def load():
@@ -81,27 +81,31 @@ def main():
     res["HNSW (neutral)"] = curve(nb, qry, gt)
     print("HNSW (neutral) built")
 
-    # find configs with a real hub/leaf split, with adaptive degree on
-    for mult in [0.9, 1.0, 1.1]:
-        idx = build(base, mult=mult, alpha=1.0, ma=1.5, mb=0.5, neutral=False)
+    # focused sweep around the useful regime (moderate hub fractions), adaptive degree on
+    configs = [
+        ("mult=1.0 a1.5 b0.5", dict(mult=1.0, alpha=1.0, ma=1.5, mb=0.5)),
+        ("mult=1.05 a1.5 b0.5", dict(mult=1.05, alpha=1.0, ma=1.5, mb=0.5)),
+        ("mult=1.1 a1.5 b0.5", dict(mult=1.1, alpha=1.0, ma=1.5, mb=0.5)),
+        ("mult=1.0 a2.0 b0.4", dict(mult=1.0, alpha=1.0, ma=2.0, mb=0.4)),
+        ("mult=1.0 a1.5 b0.5 h-alpha1.2", dict(mult=1.0, alpha=1.2, ma=1.5, mb=0.5)),
+    ]
+    for label, kw in configs:
+        idx = build(base, neutral=False, **kw)
         s = idx.get_tahnsw_stats(); tot = max(1, s["hub_count"]+s["leaf_count"]+s["mid_count"])
-        name = f"TAHNSW mult={mult} (h/l/m={100*s['hub_count']//tot}/{100*s['leaf_count']//tot}/{100*s['mid_count']//tot}%)"
+        name = f"TAHNSW {label} (h/l/m={100*s['hub_count']//tot}/{100*s['leaf_count']//tot}/{100*s['mid_count']//tot}%)"
         res[name] = curve(idx, qry, gt)
         print(name, "built")
-    # also adaptive degree + alpha=1.2
-    idx = build(base, mult=1.0, alpha=1.2, ma=1.5, mb=0.5, neutral=False)
-    res["TAHNSW mult=1.0 a=1.2"] = curve(idx, qry, gt)
-    print("TAHNSW mult=1.0 a=1.2 built")
 
-    base_iso = {t: iso(res["HNSW (neutral)"], t) for t in (0.90, 0.95, 0.99)}
+    targets = (0.90, 0.95, 0.97, 0.99)
+    base_iso = {t: iso(res["HNSW (neutral)"], t) for t in targets}
     print(f"\ndist-comps/query at fixed recall (LOWER=faster). baseline=HNSW (neutral)")
-    print(f"{'variant':40s} {'dc@0.90':>11} {'dc@0.95':>11} {'dc@0.99':>11}")
+    print(f"{'variant':52s} " + " ".join(f"{'dc@%.2f'%t:>12}" for t in targets))
     for name, c in res.items():
         cells = []
-        for t in (0.90, 0.95, 0.99):
-            v = iso(c, t); d = 100*(v-base_iso[t])/base_iso[t] if base_iso[t]==base_iso[t] else 0
-            cells.append(f"{v:7.0f}({d:+4.0f}%)")
-        print(f"{name:40s} " + " ".join(cells))
+        for t in targets:
+            v = iso(c, t); d = 100*(v-base_iso[t])/base_iso[t] if (base_iso[t]==base_iso[t] and v==v) else 0
+            cells.append(f"{v:8.0f}({d:+4.0f}%)" if v==v else f"{'nan':>13}")
+        print(f"{name:52s} " + " ".join(cells))
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     plt.figure(figsize=(9, 6))
