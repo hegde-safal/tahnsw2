@@ -67,7 +67,16 @@ build/
 .settings/
 
 # --------------------
-# Results and data (optional - uncomment to ignore)
+# Results and data
 # --------------------
-# results/
+results/
 *.hdf5
+
+# --------------------
+# TAHNSW Build Artifacts
+# --------------------
+tahnsw_cpp.*.pyd
+tahnsw_cpp.*.so
+src/hnswlib/build/
+src/hnswlib/*.egg-info/
+.pytest_cache/

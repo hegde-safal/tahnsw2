@@ -13,8 +13,13 @@ Each test follows RED-GREEN-REFACTOR cycle:
   VERIFY: All tests pass, no regressions
 """
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    pass
+
 import numpy as np
+
 import hnswlib
 import math
 from typing import Tuple, List
