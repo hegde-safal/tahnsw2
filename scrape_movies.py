@@ -11,7 +11,7 @@ import time
 import random
 from collections import Counter
 
-YEARS = list(range(1985, 2025))  # 40 years of movies
+YEARS = list(range(1970, 2025))  # 55 years of movies
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -155,9 +155,9 @@ def main():
     print("=" * 60)
     print(f"Total unique movies scraped: {len(all_movies)}")
     
-    # If we have more than 500, prioritize keeping a good genre distribution
-    if len(all_movies) > 500:
-        target = 500
+    # If we have more than 5000, trim to exactly 5000 with genre diversity
+    if len(all_movies) > 5000:
+        target = 5000
         by_genre = {}
         for m in all_movies:
             by_genre.setdefault(m['genre'], []).append(m)
@@ -171,7 +171,6 @@ def main():
             if by_genre[genre]:
                 selected.append(by_genre[genre].pop(0))
             else:
-                # Remove exhausted genres
                 genres.remove(genre)
                 if not genres:
                     break
