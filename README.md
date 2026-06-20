@@ -84,3 +84,14 @@ tahnsw/
 
 Where `M_eff ≈ 0.75 × M` on clustered data → ~25% construction speedup.
 The `k²` term is a constant (k=20 is fixed) and does not grow with N.
+
+## Running the Application
+Start the backend:
+
+pip install -r api/requirements.txt
+uvicorn api.main:app --reload
+
+Start the frontend:
+
+npm i
+cd ui
