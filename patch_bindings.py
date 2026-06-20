@@ -1,9 +1,10 @@
 import re
 
 def patch():
-    # Overwrite hnswalg.h with tahnsw_alg.h
+    # Overwrite hnswalg.h with tahnsw_alg.h and copy topology_math.h
     import shutil
     shutil.copy("src/tahnsw_alg.h", "src/hnswlib/hnswlib/hnswalg.h")
+    shutil.copy("src/topology_math.h", "src/hnswlib/hnswlib/topology_math.h")
 
     # Now modify bindings.cpp to expose set_tahnsw_config
     with open("src/hnswlib/python_bindings/bindings.cpp", "r") as f:

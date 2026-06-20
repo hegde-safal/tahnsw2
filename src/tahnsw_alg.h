@@ -551,8 +551,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void getNeighborsByHeuristic2(
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
-        const size_t M) {
+        const size_t M,
+        bool collect_tahnsw_stats = false) {
+        size_t initial_size = top_candidates.size();
         if (top_candidates.size() < M) {
+            if (collect_tahnsw_stats) {
+                tahnsw_edges_baseline += initial_size;
+            }
             return;
         }
 
@@ -594,6 +599,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         for (std::pair<dist_t, tableint> curent_pair : return_list) {
             top_candidates.emplace(-curent_pair.first, curent_pair.second);
         }
+
+        if (collect_tahnsw_stats) {
+            tahnsw_edges_baseline += std::min(M, initial_size);
+            tahnsw_edges_saved += std::max(0, (int)std::min(M, initial_size) - (int)return_list.size());
+        }
     }
 
 
@@ -624,7 +634,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         int level,
         bool isUpdate) {
         size_t Mcurmax = level ? maxM_ : maxM0_;
-        getNeighborsByHeuristic2(top_candidates, M_eff);
+        bool collect_stats = (level == 0 && topology_analyser && tahnsw_cfg.prune_layer0_only && cur_element_count > 2);
+        getNeighborsByHeuristic2(top_candidates, M_eff, collect_stats);
         if (top_candidates.size() > M_eff)
             throw std::runtime_error("Should be not be more than M_ candidates returned by the heuristic");
 
@@ -1480,28 +1491,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     top_candidates.emplace(fstdistfunc_(data_point, getDataByInternalId(enterpoint_copy), dist_func_param_), enterpoint_copy);
                     if (top_candidates.size() > ef_construction_)
                         top_candidates.pop();
-                }
-                if (level == 0 && topology_analyser && tahnsw_cfg.prune_layer0_only && cur_element_count > 2) {
-                    std::vector<std::pair<dist_t, tableint>> cands;
-                    int initial_candidates_size = top_candidates.size();
-                    while (!top_candidates.empty()) {
-                        cands.push_back(top_candidates.top());
-                        top_candidates.pop();
-                    }
-                    std::reverse(cands.begin(), cands.end());
-                    
-                    auto pruned = rng_pruner->prune(data_point, cands, M_eff, this);
-                    
-                    if (pruned.empty() && !cands.empty()) {
-                        pruned.push_back(cands[0]);
-                    }
-                    
-                    tahnsw_edges_baseline += std::min(M_eff, initial_candidates_size);
-                    tahnsw_edges_saved += std::max(0, std::min(M_eff, initial_candidates_size) - (int)pruned.size());
-                    
-                    for (const auto& p : pruned) {
-                        top_candidates.push(p);
-                    }
                 }
                 currObj = mutuallyConnectNewElement_TAHNSW(M_eff, data_point, cur_c, top_candidates, level, false);
 

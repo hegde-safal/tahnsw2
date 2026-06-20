@@ -68,7 +68,7 @@ class CountMinSketch {
     int w, d;
     std::vector<long long> a, b;  // long long to avoid overflow with large prime
     long long p;
-    std::vector<std::vector<int>> table;
+    std::vector<int> table;       // flattened 1D table: size is d * w
     long long total;
 
 public:
@@ -79,7 +79,7 @@ public:
         
         a.resize(depth);
         b.resize(depth);
-        table.resize(depth, std::vector<int>(width, 0));
+        table.assign(depth * width, 0);
         
         for (int i = 0; i < depth; ++i) {
             a[i] = dist_a(rng);
@@ -87,29 +87,25 @@ public:
         }
     }
 
-    std::vector<int> hashes(int x) const {
-        std::vector<int> h(d);
+    void add(int x, int count = 1) {
         for (int i = 0; i < d; ++i) {
             long long val = (a[i] * static_cast<long long>(x) + b[i]) % p;
             if (val < 0) val += p;  // ensure positive after modulo
-            h[i] = static_cast<int>(val % w);
-        }
-        return h;
-    }
-
-    void add(int x, int count = 1) {
-        auto h = hashes(x);
-        for (int i = 0; i < d; ++i) {
-            table[i][h[i]] += count;
+            int h = static_cast<int>(val % w);
+            table[i * w + h] += count;
         }
         total += count;
     }
 
     int query(int x) const {
-        auto h = hashes(x);
-        int min_val = table[0][h[0]];
+        long long val0 = (a[0] * static_cast<long long>(x) + b[0]) % p;
+        if (val0 < 0) val0 += p;
+        int min_val = table[static_cast<int>(val0 % w)];
         for (int i = 1; i < d; ++i) {
-            min_val = std::min(min_val, table[i][h[i]]);
+            long long val = (a[i] * static_cast<long long>(x) + b[i]) % p;
+            if (val < 0) val += p;
+            int h = static_cast<int>(val % w);
+            min_val = std::min(min_val, table[i * w + h]);
         }
         return min_val;
     }
@@ -181,8 +177,7 @@ public:
         std::vector<dist_t> dists_to_new;
         dists_to_new.reserve(candidates.size());
         for (const auto& c : candidates) {
-            char* cand_data = index->getDataByInternalId(c.second);
-            dists_to_new.push_back(space->get_dist_func()(new_data, cand_data, space->get_dist_func_param()));
+            dists_to_new.push_back(c.first);
         }
 
         std::vector<dist_t> sorted_dists = dists_to_new;
@@ -213,35 +208,49 @@ public:
     LayerAssigner(TAHNSWConfig config) : cfg(config) {}
 
     int assign(float C_v, float B_v_norm, int current_n, int M_base, int max_layer, float random_val) {
-        if (C_v < cfg.cluster_low_thresh) {
-            int hub_level = std::max(1, static_cast<int>(std::log(std::max(current_n, 2)) / std::log(M_base)));
-            if (B_v_norm > 0.6f) {
-                hub_level = std::min(max_layer, hub_level + 1);
+        if (cfg.fast_construction) {
+            double mL = 1.0 / std::log(M_base);
+            int base_level = static_cast<int>(-std::log(std::max(random_val, 1e-10f)) * mL);
+
+            if (C_v < cfg.cluster_low_thresh) {
+                // Hub: apply a strong boost to the exponential base level, but let it stay 0 if base_level is 0
+                float hub_score = 1.0f - C_v;
+                float boost_factor = 1.5f + 1.0f * hub_score + 0.5f * B_v_norm;
+                int adjusted = static_cast<int>(base_level * boost_factor);
+                return std::min(max_layer, adjusted);
             }
-            return std::min(max_layer, hub_level);
+
+            if (C_v > cfg.cluster_high_thresh) {
+                return 0; // Leaves always stay at level 0
+            }
+
+            // Mid nodes: standard boost to the exponential base level
+            float hub_score = 1.0f - C_v;
+            float boost_factor = 1.0f + 0.4f * hub_score + 0.3f * B_v_norm;
+            int adjusted = static_cast<int>(base_level * boost_factor);
+            return std::min(max_layer, adjusted);
+        } else {
+            // Legacy / Original behavior
+            if (C_v < cfg.cluster_low_thresh) {
+                int hub_level = std::max(1, static_cast<int>(std::log(std::max(current_n, 2)) / std::log(M_base)));
+                if (B_v_norm > 0.6f) {
+                    hub_level = std::min(max_layer, hub_level + 1);
+                }
+                return std::min(max_layer, hub_level);
+            }
+
+            if (C_v > cfg.cluster_high_thresh) {
+                return 0;
+            }
+
+            double mL = 1.0 / std::log(M_base);
+            int base_level = static_cast<int>(-std::log(std::max(random_val, 1e-10f)) * mL);
+
+            float hub_score = 1.0f - C_v;
+            float boost_factor = 1.0f + 0.4f * hub_score + 0.3f * B_v_norm;
+            int adjusted = std::max(1, static_cast<int>(base_level * boost_factor));
+            return std::min(max_layer, adjusted);
         }
-
-        if (C_v > cfg.cluster_high_thresh) {
-            return 0;
-        }
-
-        double mL = 1.0 / std::log(M_base);
-        int base_level = static_cast<int>(-std::log(std::max(random_val, 1e-10f)) * mL);
-
-        float hub_score = 1.0f - C_v;
-        float boost_factor = 1.0f + 0.4f * hub_score + 0.3f * B_v_norm;
-        // OPT(build+search): keep HNSW's exponential layer distribution. The old
-        // std::max(1, ...) floor forced EVERY mid node to level >= 1, so ~100% of
-        // nodes ended up in the upper layers (vs ~1/ln(M) in real HNSW). That made
-        // each insert run a full search at level 1 too, and bloated the hierarchy.
-        // A base_level draw of 0 (the common case) must stay at level 0; the
-        // topology boost only lifts nodes that already drew a higher level.
-        // (Legacy path keeps the old std::max(1,...) floor for A/B comparison.)
-        int adjusted = cfg.fast_construction
-            ? static_cast<int>(base_level * boost_factor)
-            : std::max(1, static_cast<int>(base_level * boost_factor));
-
-        return std::min(max_layer, adjusted);
     }
 };
 

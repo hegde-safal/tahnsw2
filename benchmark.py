@@ -278,15 +278,16 @@ def plot_results(hnsw_res: dict, tahnsw_res: dict, tahnsw_cpp_res: dict, title: 
     ax = axes[0]
     h_recalls = [p["recall"] for p in hnsw_res["curve"]]
     h_qps     = [p["qps"]    for p in hnsw_res["curve"]]
-    t_recalls = [p["recall"] for p in tahnsw_res["curve"]]
-    t_qps     = [p["qps"]    for p in tahnsw_res["curve"]]
+    t_recalls = [p["recall"] for p in tahnsw_res["curve"]] if tahnsw_res else []
+    t_qps     = [p["qps"]    for p in tahnsw_res["curve"]] if tahnsw_res else []
     tc_recalls = [p["recall"] for p in tahnsw_cpp_res["curve"]] if tahnsw_cpp_res else []
     tc_qps     = [p["qps"]    for p in tahnsw_cpp_res["curve"]] if tahnsw_cpp_res else []
 
     ax.plot(h_recalls, h_qps, "o-", color="#888780", lw=2, ms=6,
             label=f"HNSW  (build {hnsw_res['build_time']:.1f}s)")
-    ax.plot(t_recalls, t_qps, "s-", color="#534AB7", lw=2.5, ms=7,
-            label=f"TAHNSW (build {tahnsw_res['build_time']:.1f}s)")
+    if tahnsw_res:
+        ax.plot(t_recalls, t_qps, "s-", color="#534AB7", lw=2.5, ms=7,
+                label=f"TAHNSW (build {tahnsw_res['build_time']:.1f}s)")
     
     if tahnsw_cpp_res:
         ax.plot(tc_recalls, tc_qps, "^-", color="#E63946", lw=2.5, ms=7,
@@ -319,21 +320,32 @@ def plot_results(hnsw_res: dict, tahnsw_res: dict, tahnsw_cpp_res: dict, title: 
 
     # ── Build time bar ────────────────────────────────────────────────────────
     ax2 = axes[1]
-    methods  = ["HNSW", "TAHNSW Python"]
-    times    = [hnsw_res["build_time"], tahnsw_res["build_time"]]
-    colors   = ["#888780", "#534AB7"]
+    methods  = ["HNSW"]
+    times    = [hnsw_res["build_time"]]
+    colors   = ["#888780"]
     
+    if tahnsw_res:
+        methods.append("TAHNSW Python")
+        times.append(tahnsw_res["build_time"])
+        colors.append("#534AB7")
     if tahnsw_cpp_res:
         methods.append("TAHNSW C++")
         times.append(tahnsw_cpp_res["build_time"])
         colors.append("#E63946")
+        
     bars     = ax2.bar(methods, times, color=colors, width=0.4, edgecolor="none")
     for bar, t in zip(bars, times):
         ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
                  f"{t:.1f}s", ha="center", va="bottom", fontsize=11, fontweight="bold")
 
-    delta = 100 * (1 - tahnsw_res["build_time"] / max(1e-9, hnsw_res["build_time"]))
-    ax2.set_title(f"Index build time\nTAHNSW is {delta:+.1f}% vs HNSW", fontsize=11)
+    if tahnsw_res:
+        delta = 100 * (1 - tahnsw_res["build_time"] / max(1e-9, hnsw_res["build_time"]))
+        ax2.set_title(f"Index build time\nTAHNSW is {delta:+.1f}% vs HNSW", fontsize=11)
+    elif tahnsw_cpp_res:
+        delta = 100 * (1 - tahnsw_cpp_res["build_time"] / max(1e-9, hnsw_res["build_time"]))
+        ax2.set_title(f"Index build time\nTAHNSW C++ is {delta:+.1f}% vs HNSW", fontsize=11)
+    else:
+        ax2.set_title("Index build time", fontsize=11)
     ax2.set_ylabel("Seconds", fontsize=12)
     ax2.grid(True, alpha=0.3, axis="y")
 
@@ -358,6 +370,7 @@ def main():
     parser.add_argument("--ef_construction", type=int, default=200)
     parser.add_argument("--space",   default="l2", choices=["l2", "cosine"])
     parser.add_argument("--outdir",  default="results")
+    parser.add_argument("--skip_py", action="store_true", help="Skip the slow Python TAHNSW benchmark")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -399,11 +412,16 @@ def main():
         M=args.M, ef_const=args.ef_construction,
         ef_search_values=ef_values, k=args.k, space=args.space
     )
-    tahnsw_res = benchmark_tahnsw(
-        data, queries, gt,
-        M=args.M, ef_const=args.ef_construction,
-        ef_search_values=ef_values, k=args.k, space=args.space, config=cfg
-    )
+    if args.skip_py:
+        print("\n[TAHNSW] Skipping Python benchmark as requested (--skip_py).")
+        tahnsw_res = None
+    else:
+        tahnsw_res = benchmark_tahnsw(
+            data, queries, gt,
+            M=args.M, ef_const=args.ef_construction,
+            ef_search_values=ef_values, k=args.k, space=args.space, config=cfg
+        )
+    
     tahnsw_cpp_res = benchmark_tahnsw_cpp(
         data, queries, gt,
         M=args.M, ef_const=args.ef_construction,
@@ -430,22 +448,54 @@ def main():
     print("\n" + "="*80)
     print("RESULTS SUMMARY")
     print("="*80)
-    print(f"{'ef':>6}  {'HNSW rec':>10}  {'HNSW QPS':>10}  "
-          f"{'TAHNSW rec':>12}  {'TAHNSW QPS':>12}  "
-          f"{'C++ rec':>10}  {'C++ QPS':>10}  {'QPS delta (Py)':>15}")
-    print("-" * 80)
-    for h, t, tc in zip(hnsw_res["curve"], tahnsw_res["curve"], tahnsw_cpp_res["curve"]):
-        delta = 100 * (t["qps"] - h["qps"]) / max(h["qps"], 1e-9)
-        print(f"{h['ef']:>6}  {h['recall']:>10.4f}  {h['qps']:>10.1f}  "
-              f"{t['recall']:>12.4f}  {t['qps']:>12.1f}  "
-              f"{tc['recall']:>10.4f}  {tc['qps']:>10.1f}  {delta:>+14.1f}%")
+    
+    has_t = tahnsw_res is not None
+    has_tc = tahnsw_cpp_res is not None
 
-    bt_delta = 100 * (1 - tahnsw_res["build_time"] / max(hnsw_res["build_time"], 1e-9))
-    cpp_delta = 100 * (1 - tahnsw_cpp_res["build_time"] / max(tahnsw_res["build_time"], 1e-9))
-    print("-"*80)
-    print(f"Build time:  HNSW {hnsw_res['build_time']:.2f}s  "
-          f"vs  TAHNSW (Py) {tahnsw_res['build_time']:.2f}s  ({bt_delta:+.1f}%)  "
-          f"vs  TAHNSW (C++) {tahnsw_cpp_res['build_time']:.2f}s  ({cpp_delta:+.1f}% faster than Py)")
+    header = f"{'ef':>6}  {'HNSW rec':>10}  {'HNSW QPS':>10}"
+    if has_t:
+        header += f"  {'TAHNSW rec':>12}  {'TAHNSW QPS':>12}  {'Delta (Py)':>11}"
+    if has_tc:
+        header += f"  {'C++ rec':>10}  {'C++ QPS':>10}  {'Delta (C++)':>13}"
+    print(header)
+    print("-" * len(header))
+
+    curves_to_zip = [hnsw_res["curve"]]
+    if has_t:
+        curves_to_zip.append(tahnsw_res["curve"])
+    else:
+        curves_to_zip.append([None] * len(hnsw_res["curve"]))
+    if has_tc:
+        curves_to_zip.append(tahnsw_cpp_res["curve"])
+    else:
+        curves_to_zip.append([None] * len(hnsw_res["curve"]))
+
+    for items in zip(*curves_to_zip):
+        h = items[0]
+        t = items[1]
+        tc = items[2]
+        row = f"{h['ef']:>6}  {h['recall']:>10.4f}  {h['qps']:>10.1f}"
+        if has_t and t is not None:
+            delta_py = 100 * (t["qps"] - h["qps"]) / max(h["qps"], 1e-9)
+            row += f"  {t['recall']:>12.4f}  {t['qps']:>12.1f}  {delta_py:>+10.1f}%"
+        if has_tc and tc is not None:
+            delta_cpp = 100 * (tc["qps"] - h["qps"]) / max(h["qps"], 1e-9)
+            row += f"  {tc['recall']:>10.4f}  {tc['qps']:>10.1f}  {delta_cpp:>+12.1f}%"
+        print(row)
+
+    build_time_str = f"Build time:  HNSW {hnsw_res['build_time']:.2f}s"
+    if has_t:
+        bt_delta = 100 * (1 - tahnsw_res["build_time"] / max(hnsw_res["build_time"], 1e-9))
+        build_time_str += f"  vs  TAHNSW (Py) {tahnsw_res['build_time']:.2f}s  ({bt_delta:+.1f}%)"
+    if has_tc:
+        if has_t:
+            cpp_delta = 100 * (1 - tahnsw_cpp_res["build_time"] / max(tahnsw_res["build_time"], 1e-9))
+            build_time_str += f"  vs  TAHNSW (C++) {tahnsw_cpp_res['build_time']:.2f}s  ({cpp_delta:+.1f}% faster than Py)"
+        else:
+            cpp_delta_hnsw = 100 * (1 - tahnsw_cpp_res["build_time"] / max(hnsw_res["build_time"], 1e-9))
+            build_time_str += f"  vs  TAHNSW (C++) {tahnsw_cpp_res['build_time']:.2f}s  ({cpp_delta_hnsw:+.1f}% vs HNSW)"
+    print("-" * len(header))
+    print(build_time_str)
     
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_path = os.path.join(args.outdir, "recall_qps_curve.png")

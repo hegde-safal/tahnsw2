@@ -414,7 +414,7 @@ class TAHNSWStats:
     edges_baseline: int   = 0
     build_time_s:   float = 0.0
 
-    def log_summary(self) -> None:
+    def log_summary(self, M_base: Optional[int] = None) -> None:
         log.info("=" * 55)
         log.info("TAHNSW Build Statistics")
         log.info("=" * 55)
@@ -427,7 +427,7 @@ class TAHNSWStats:
         log.info(f"  Layer dist    : {dict(sorted(self.layer_dist.items()))}")
         if self.M_values:
             log.info(f"  Mean M_eff    : {np.mean(self.M_values):.2f}  "
-                     f"(base M={self.M_values[0] if self.M_values else '?'})")
+                     f"(base M={M_base if M_base is not None else (self.M_values[0] if self.M_values else '?')})")
         edge_pct = 100*(1 - self.edges_saved/max(1,self.edges_baseline))
         log.info(f"  Edge reduction: {100-edge_pct:.1f}%  "
                  f"({self.edges_saved:,} / {self.edges_baseline:,} saved)")
@@ -729,7 +729,7 @@ class TAHNSWIndex:
         self.stats.build_time_s = time.perf_counter() - t0
 
         if self.cfg.verbose:
-            self.stats.log_summary()
+            self.stats.log_summary(self._M_base)
 
     # ── Search  (delegates to hnswlib — identical to HNSW) ───────────────────
 

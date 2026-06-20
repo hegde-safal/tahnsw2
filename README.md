@@ -41,15 +41,29 @@ queries = np.random.randn(100, 128).astype(np.float32)
 labels, dists = idx.knn_query(queries, k=10)
 ```
 
+## Compilation and Installation (C++ Extension)
+
+To compile and install the optimized C++ implementation of TAHNSW:
+
+```bash
+# Build and patch pybind11 bindings
+python patch_bindings.py
+
+# Install the extension
+pip install src/hnswlib
+```
+
+Once installed, you can use the optimized C++ implementation via `import tahnsw_cpp` or use it automatically in the benchmark suite.
+
 ## Benchmark
 
 ```bash
 # Quick test on synthetic clustered data (no downloads needed)
 python benchmark.py --mode synthetic --N 30000 --dim 128 --k 10
 
-# Full benchmark on SIFT-128 (download first)
+# Full benchmark on SIFT-128 (use --skip_py to skip the slow Python version on 1M vectors)
 wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
-python benchmark.py --mode hdf5 --dataset sift-128-euclidean.hdf5 --k 10
+python benchmark.py --mode hdf5 --dataset sift-128-euclidean.hdf5 --skip_py --k 10
 ```
 
 ## Hyperparameter Tuning Guide
@@ -67,10 +81,14 @@ python benchmark.py --mode hdf5 --dataset sift-128-euclidean.hdf5 --k 10
 
 ```
 tahnsw/
-├── tahnsw.py         # Main implementation — TAHNSWIndex + all modules
-├── benchmark.py      # TAHNSW vs HNSW benchmark runner
-├── requirements.txt  # Dependencies
-└── README.md         # This file
+├── src/
+│   ├── tahnsw_alg.h      # Core C++ implementation of TAHNSW
+│   └── topology_math.h   # C++ Count-Min Sketch & Layer Assigner
+├── tahnsw.py             # Reference Python implementation
+├── patch_bindings.py     # Integrates C++ headers with hnswlib and builds bindings
+├── benchmark.py          # HNSW vs TAHNSW C++ benchmark runner
+├── requirements.txt      # Dependencies
+└── README.md             # This file
 ```
 
 ## Algorithm Complexity
