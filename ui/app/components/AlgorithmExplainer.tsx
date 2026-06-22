@@ -31,7 +31,9 @@ TAHNSW computes an approximate betweenness centrality score using BFS sketches a
 • Hub nodes: M_eff = M × M_alpha (e.g. 1.5× = 24 connections)
 • Leaf nodes: M_eff = M × M_beta (e.g. 0.5× = 8 connections)
 
-This reduces the total edge count by ~25% on clustered data, speeding up construction while maintaining recall — because the edges that matter most (hub-to-hub long-range links) are preserved.`,
+This reduces the total edge count by ~26% on clustered data, speeding up construction while maintaining recall — because the edges that matter most (hub-to-hub long-range links) are preserved.
+
+In the C++ implementation, this is done during a single-pass construction with O(N) memory overhead for the betweenness sketches.`,
     },
     {
         number: "03",
@@ -46,7 +48,7 @@ An edge (u, v) is removed if there exists a third node w such that:
 
 This removes "dominated" edges — connections that are redundant because a shorter path already exists through a third node. The result is a sparser, more navigable graph where each hop carries more information.
 
-Combined with Contribution 2, this reduces total edges at Layer 0 by up to 30% while keeping or improving recall on clustered embedding distributions.`,
+Combined with Contribution 2, this reduces total edges at Layer 0 by up to 30% while keeping or improving recall on clustered embedding distributions. The C++ implementation applies RNG pruning in a post-processing pass after all neighbors are selected, using an angular distance check to avoid removing edges that would create disconnected components.`,
     },
 ];
 

@@ -1,0 +1,512 @@
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+import { motion, useInView } from "framer-motion";
+import {
+    LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+    ResponsiveContainer, BarChart, Bar, Cell,
+    LabelList, ReferenceLine, Legend,
+} from "recharts";
+
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface CurvePoint { ef: number; recall: number; qps: number; }
+interface BenchmarkData {
+    hnsw: { curve: CurvePoint[]; build_time: number };
+    tahnsw: { curve: CurvePoint[]; build_time: number; stats: any };
+}
+
+const CUSTOM_TOOLTIP_STYLE = {
+    background: "var(--surface-2)",
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    color: "var(--text)",
+    fontSize: "0.78rem",
+    fontFamily: "var(--mono)",
+    padding: "8px 12px",
+};
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+    return (
+        <h2 style={{ fontSize: "1.25rem", fontWeight: 700, color: "var(--text)", marginBottom: 6 }}>
+            {children}
+        </h2>
+    );
+}
+
+function StatCell({
+    label, value, color, sub,
+}: {
+    label: string; value: string; color?: string; sub?: string;
+}) {
+    return (
+        <div style={{
+            background: "var(--surface-2)", border: "1px solid var(--border)",
+            borderRadius: 12, padding: "14px 16px", display: "flex",
+            flexDirection: "column", gap: 4, flex: "1 1 auto", minWidth: 100,
+        }}>
+            <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span>
+            <span style={{ fontSize: "1.3rem", fontWeight: 700, fontFamily: "var(--mono)", color: color || "var(--text)" }}>{value}</span>
+            {sub && <span style={{ fontSize: "0.65rem", color: "var(--text-dim)" }}>{sub}</span>}
+        </div>
+    );
+}
+
+/** Tooltip for the Recall-QPS chart: shows QPS on X, Recall on Y */
+function RecallQpsTooltip({ active, payload }: any) {
+    if (!active || !payload?.length) return null;
+    return (
+        <div style={CUSTOM_TOOLTIP_STYLE}>
+            {payload.map((p: any) => (
+                <div key={p.dataKey} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: p.color }} />
+                    <span style={{ color: "var(--text-muted)" }}>{p.name}</span>
+                    <span style={{ fontFamily: "var(--mono)", marginLeft: "auto", paddingLeft: 12, color: "var(--text)" }}>
+                        {Number(p.value).toFixed(4)}
+                    </span>
+                </div>
+            ))}
+            <div style={{ color: "var(--text-dim)", fontSize: "0.7rem", marginTop: 4, borderTop: "1px solid var(--border)", paddingTop: 4 }}>
+                QPS: {payload[0]?.payload?.qps?.toLocaleString() ?? "—"}
+            </div>
+        </div>
+    );
+}
+
+/** Tooltip for build time bar chart */
+function BuildTooltip({ active, payload }: any) {
+    if (!active || !payload?.length) return null;
+    return (
+        <div style={CUSTOM_TOOLTIP_STYLE}>
+            <span style={{ color: "var(--text-muted)" }}>{payload[0].payload.name}: </span>
+            <strong style={{ fontFamily: "var(--mono)", color: "var(--text)" }}>{Number(payload[0].value).toFixed(3)}s</strong>
+        </div>
+    );
+}
+
+/**
+ * Interpolate recall and latency at a target recall level for each curve.
+ * Returns array of { label, latency_ms, qps, recall } sorted by the interpolated point.
+ */
+function interpolateAtRecall(curve: CurvePoint[], targetRecall: number) {
+    // curve is sorted by ef asc, recall asc
+    const sorted = [...curve].sort((a, b) => a.recall - b.recall);
+    for (let i = 0; i < sorted.length - 1; i++) {
+        const a = sorted[i], b = sorted[i + 1];
+        if (a.recall <= targetRecall && targetRecall <= b.recall) {
+            const t = (targetRecall - a.recall) / (b.recall - a.recall);
+            const interpQps = a.qps + t * (b.qps - a.qps);
+            return { qps: Math.round(interpQps), latencyMs: +(1000 / interpQps).toFixed(3) };
+        }
+    }
+    // clamp to nearest
+    const nearest = sorted.reduce((best, p) =>
+        Math.abs(p.recall - targetRecall) < Math.abs(best.recall - targetRecall) ? p : best
+    );
+    return { qps: Math.round(nearest.qps), latencyMs: +(1000 / nearest.qps).toFixed(3) };
+}
+
+export default function MetricsDashboard() {
+    const ref = useRef<HTMLDivElement>(null);
+    const inView = useInView(ref, { once: true, margin: "-80px" });
+    const [data, setData] = useState<BenchmarkData | null>(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState("");
+
+    useEffect(() => {
+        if (!inView || data || loading) return;
+        setLoading(true);
+        fetch(`${API}/api/benchmark`)
+            .then((r) => r.json())
+            .then((d) => { setData(d); setLoading(false); })
+            .catch(() => { setError("Could not load benchmark data."); setLoading(false); });
+    }, [inView]);
+
+    // -- Transform data for charts --------------------------------------
+
+    // Recall-QPS curve: data sorted by QPS descending (so line goes left→right = fast→slow)
+    const recallQpsData = data
+        ? data.hnsw.curve.map((h, i) => ({
+            qps: Math.round(h.qps),
+            recall_hnsw: +h.recall.toFixed(4),
+            recall_tahnsw: +(data.tahnsw.curve[i]?.recall ?? 0).toFixed(4),
+            ef: h.ef,
+        })).sort((a, b) => b.qps - a.qps)   // high QPS first = rightward
+        : [];
+
+    // Build time bar data
+    const buildBarData = data
+        ? [
+            { name: "HNSW", time: data.hnsw.build_time, color: "var(--hnsw)" },
+            { name: "TAHNSW C++", time: data.tahnsw.build_time, color: "var(--primary)" },
+        ]
+        : [];
+
+    // -- Interpolated latency table at standard recall levels ------------
+    const RECALL_LEVELS = [0.90, 0.95, 0.99];
+    const latencyTable = data
+        ? RECALL_LEVELS.map((target) => {
+            const h = interpolateAtRecall(data.hnsw.curve, target);
+            const t = interpolateAtRecall(data.tahnsw.curve, target);
+            const speedup = h.latencyMs / t.latencyMs;
+            return {
+                recall: target,
+                hLatency: h.latencyMs,
+                tLatency: t.latencyMs,
+                hQps: h.qps,
+                tQps: t.qps,
+                speedup,
+                tahnswFaster: speedup > 1,
+            };
+        })
+        : [];
+
+    // -- Summary stats --------------------------------------------------
+    const maxRecallHnsw = data ? Math.max(...data.hnsw.curve.map(c => c.recall)) : 0;
+    const maxRecallTahnsw = data ? Math.max(...data.tahnsw.curve.map(c => c.recall)) : 0;
+    const recallAtHighEfHnsw = data ? data.hnsw.curve[data.hnsw.curve.length - 1]?.recall : 0;
+    const recallAtHighEfTahnsw = data ? data.tahnsw.curve[data.tahnsw.curve.length - 1]?.recall : 0;
+
+    return (
+        <div ref={ref} style={{ width: "100%", maxWidth: 1100 }}>
+            <motion.div
+                initial={{ opacity: 0, y: 32 }}
+                animate={inView ? { opacity: 1, y: 0 } : {}}
+                transition={{ duration: 0.5 }}
+            >
+                {/* Section header */}
+                <div style={{ textAlign: "center", marginBottom: 40 }}>
+                    <div style={{ display: "inline-flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <span style={{
+                            display: "inline-block",
+                            width: 8, height: 8, borderRadius: "50%",
+                            background: "var(--primary)",
+                            boxShadow: "0 0 8px var(--primary-glow)",
+                        }} />
+                        <span style={{
+                            fontSize: "0.7rem", fontWeight: 600, letterSpacing: "0.1em",
+                            textTransform: "uppercase", color: "var(--primary)",
+                        }}>
+                            Performance Metrics
+                        </span>
+                    </div>
+                    <SectionTitle>Benchmark Results — C++ Bindings</SectionTitle>
+                    <p style={{ color: "var(--text-muted)", fontSize: "0.88rem" }}>
+                        {data
+                            ? `${data.hnsw.curve.length}-point ef sweep · 200 queries · cosine distance · C++ extension`
+                            : "Running against movie corpus · cosine distance · C++ extension"}
+                    </p>
+                </div>
+
+                {loading && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "48px 0", color: "var(--text-muted)", fontSize: "0.88rem" }}>
+                        <div className="pulse-dot" />
+                        Running benchmark sweep…
+                    </div>
+                )}
+
+                {error && <p style={{ color: "var(--warning)", textAlign: "center" }}>{error}</p>}
+
+                {data && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+
+                        {/* ==============================================================
+                            ROW 1: Recall-QPS curve (main chart)
+                        ============================================================== */}
+                        <div className="card" style={{ padding: "24px 28px 20px" }}>
+                            <div style={{ marginBottom: 20 }}>
+                                <h3 style={{ fontSize: "1rem", fontWeight: 700, color: "var(--text)" }}>
+                                    Recall vs. Throughput (QPS)
+                                </h3>
+                                <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>
+                                    X-axis = queries per second (log scale, higher is faster). Y-axis = recall@k (higher is more accurate).
+                                    <br />
+                                    A curve shifted <strong style={{ color: "var(--text)" }}>up and right</strong> means better accuracy at every speed level.
+                                </p>
+                            </div>
+
+                            <ResponsiveContainer width="100%" height={320}>
+                                <LineChart
+                                    data={recallQpsData}
+                                    margin={{ top: 12, right: 24, bottom: 40, left: 8 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                                    <XAxis
+                                        dataKey="qps"
+                                        type="number"
+                                        scale="log"
+                                        domain={["dataMin", "dataMax"]}
+                                        tick={{ fill: "var(--text-muted)", fontSize: 11 }}
+                                        tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}k` : String(v)}
+                                        label={{
+                                            value: "QPS (log scale) →",
+                                            position: "insideBottom",
+                                            offset: -24,
+                                            fill: "var(--text-muted)",
+                                            fontSize: 11,
+                                        }}
+                                    />
+                                    <YAxis
+                                        tick={{ fill: "var(--text-muted)", fontSize: 11 }}
+                                        tickFormatter={(v: number) => v.toFixed(2)}
+                                        domain={[0.7, 1.005]}
+                                        label={{
+                                            value: "Recall →",
+                                            angle: -90,
+                                            position: "insideLeft",
+                                            offset: 4,
+                                            fill: "var(--text-muted)",
+                                            fontSize: 11,
+                                        }}
+                                        width={48}
+                                    />
+                                    <ReferenceLine
+                                        y={1}
+                                        stroke="var(--border)"
+                                        strokeDasharray="4 2"
+                                        label={{ value: "Perfect recall", position: "right", fill: "var(--text-dim)", fontSize: 10 }}
+                                    />
+                                    <Tooltip content={<RecallQpsTooltip />} />
+                                    <Legend
+                                        verticalAlign="top"
+                                        align="right"
+                                        iconType="line"
+                                        iconSize={24}
+                                        wrapperStyle={{ fontSize: "0.78rem", color: "var(--text-muted)", fontFamily: "var(--font)" }}
+                                    />
+                                    <Line
+                                        name="HNSW (hnswlib)"
+                                        type="monotone"
+                                        dataKey="recall_hnsw"
+                                        stroke="var(--hnsw)"
+                                        strokeWidth={2}
+                                        dot={{ r: 3, fill: "var(--hnsw)", strokeWidth: 0 }}
+                                        activeDot={{ r: 5, fill: "var(--hnsw)", strokeWidth: 0 }}
+                                    />
+                                    <Line
+                                        name="TAHNSW (C++)"
+                                        type="monotone"
+                                        dataKey="recall_tahnsw"
+                                        stroke="var(--primary)"
+                                        strokeWidth={2.5}
+                                        dot={{ r: 3, fill: "var(--primary)", strokeWidth: 0 }}
+                                        activeDot={{ r: 5, fill: "var(--primary)", strokeWidth: 0 }}
+                                    />
+                                </LineChart>
+                            </ResponsiveContainer>
+
+                            {/* Per-ef annotation strip */}
+                            <div style={{
+                                display: "flex", gap: 12, marginTop: 12, paddingTop: 12,
+                                borderTop: "1px solid var(--border)", flexWrap: "wrap",
+                            }}>
+                                {recallQpsData.map((d, i) => (
+                                    <div key={i} style={{
+                                        background: "var(--surface-2)", borderRadius: 8, padding: "6px 10px",
+                                        fontSize: "0.65rem", fontFamily: "var(--mono)", color: "var(--text-muted)",
+                                        display: "flex", gap: 6, alignItems: "center",
+                                    }}>
+                                        <span style={{ color: "var(--text-dim)" }}>ef={d.ef}</span>
+                                        <span style={{ color: "var(--hnsw)" }}>H:{d.recall_hnsw.toFixed(3)}</span>
+                                        <span style={{ color: "var(--primary)" }}>T:{d.recall_tahnsw.toFixed(3)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* ==============================================================
+                            ROW 2: Build time + Latency table
+                        ============================================================== */}
+                        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }>
+
+                            {/* Build time bar chart */}
+                            <div className="card" style={{ flex: "1 1 260px", padding: "20px 24px 16px" }}>
+                                <div style={{ marginBottom: 16 }}>
+                                    <h3 style={{ fontSize: "0.92rem", fontWeight: 700, color: "var(--text)" }}>
+                                        Index Build Time
+                                    </h3>
+                                    <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 3 }}>
+                                        Wall-clock seconds, single-threaded
+                                    </p>
+                                </div>
+
+                                <ResponsiveContainer width="100%" height={160}>
+                                    <BarChart
+                                        data={buildBarData}
+                                        layout="vertical"
+                                        margin={{ left: 4, right: 60, top: 4, bottom: 4 }}
+                                    >
+                                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
+                                        <XAxis
+                                            type="number"
+                                            tick={{ fill: "var(--text-muted)", fontSize: 11 }}
+                                            tickFormatter={(v: number) => `${v.toFixed(1)}s`}
+                                        />
+                                        <YAxis
+                                            dataKey="name"
+                                            type="category"
+                                            tick={{ fill: "var(--text)", fontSize: 13, fontWeight: 600 }}
+                                            width={90}
+                                        />
+                                        <Tooltip content={<BuildTooltip />} />
+                                        <Bar dataKey="time" radius={[0, 6, 6, 0]} maxBarSize={32}>
+                                            {buildBarData.map((entry, index) => (
+                                                <Cell key={index} fill={entry.color} />
+                                            ))}
+                                            <LabelList
+                                                dataKey="time"
+                                                position="right"
+                                                formatter={(v: number) => `${v.toFixed(2)}s`}
+                                                style={{ fill: "var(--text-muted)", fontSize: 11, fontFamily: "var(--mono)" }}
+                                            />
+                                        </Bar>
+                                    </BarChart>
+                                </ResponsiveContainer>
+
+                                {/* Ratio callout */}
+                                {data.tahnsw.build_time > data.hnsw.build_time && (
+                                    <div style={{
+                                        marginTop: 12, padding: "8px 12px",
+                                        background: "var(--surface-2)", borderRadius: 8,
+                                        fontSize: "0.75rem", color: "var(--text-muted)",
+                                        display: "flex", justifyContent: "space-between",
+                                    }}>
+                                        <span>TAHNSW overhead</span>
+                                        <span style={{ fontFamily: "var(--mono)", color: "var(--warning)" }}>
+                                            {(data.tahnsw.build_time / data.hnsw.build_time).toFixed(1)}x slower build
+                                        </span>
+                                    </div>
+                                )}
+                                {data.tahnsw.build_time <= data.hnsw.build_time && (
+                                    <div style={{
+                                        marginTop: 12, padding: "8px 12px",
+                                        background: "var(--surface-2)", borderRadius: 8,
+                                        fontSize: "0.75rem", color: "var(--text-muted)",
+                                        display: "flex", justifyContent: "space-between",
+                                    }}>
+                                        <span>TAHNSW build advantage</span>
+                                        <span style={{ fontFamily: "var(--mono)", color: "var(--success)" }}>
+                                            {(data.hnsw.build_time / data.tahnsw.build_time).toFixed(1)}x faster
+                                        </span>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Latency comparison table */}
+                            <div className="card" style={{ flex: "1 1 340px", padding: "20px 24px" }}>
+                                <div style={{ marginBottom: 16 }}>
+                                    <h3 style={{ fontSize: "0.92rem", fontWeight: 700, color: "var(--text)" }}>
+                                        Latency at Matched Recall
+                                    </h3>
+                                    <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 3 }}>
+                                        Interpolated from ef sweep — lower is better
+                                    </p>
+                                </div>
+
+                                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.82rem" }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                                            <th style={{ textAlign: "left", padding: "6px 8px", color: "var(--text-muted)", fontWeight: 600, fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.06em" }}>Target Recall</th>
+                                            <th style={{ textAlign: "right", padding: "6px 8px", color: "var(--hnsw)", fontWeight: 600, fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.06em" }}>HNSW Latency</th>
+                                            <th style={{ textAlign: "right", padding: "6px 8px", color: "var(--primary)", fontWeight: 600, fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.06em" }}>TAHNSW Latency</th>
+                                            <th style={{ textAlign: "right", padding: "6px 8px", color: "var(--text-muted)", fontWeight: 600, fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.06em" }}>Ratio</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {latencyTable.map((row) => (
+                                            <tr key={row.recall} style={{ borderBottom: "1px solid var(--border)" }}>
+                                                <td style={{ padding: "8px", fontFamily: "var(--mono)", color: "var(--text)" }}>
+                                                    {(row.recall * 100).toFixed(0)}%
+                                                </td>
+                                                <td style={{ padding: "8px", textAlign: "right", fontFamily: "var(--mono)", color: "var(--hnsw)" }}>
+                                                    {row.hLatency} ms
+                                                </td>
+                                                <td style={{ padding: "8px", textAlign: "right", fontFamily: "var(--mono)", color: "var(--primary)" }}>
+                                                    {row.tLatency} ms
+                                                </td>
+                                                <td style={{ padding: "8px", textAlign: "right", fontFamily: "var(--mono)", color: row.tahnswFaster ? "var(--success)" : "var(--warning)" }}>
+                                                    {row.speedup > 1 ? "▼" : "▲"} {row.speedup.toFixed(2)}x
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* ==============================================================
+                            ROW 3: Key stats grid (replaces donut)
+                        ============================================================== */}
+                        <div className="card" style={{ padding: "24px 28px" }}>
+                            <div style={{ marginBottom: 20 }}>
+                                <h3 style={{ fontSize: "1rem", fontWeight: 700, color: "var(--text)" }}>
+                                    TAHNSW C++ — Topology-Aware Construction Metrics
+                                </h3>
+                                <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>
+                                    Statistics collected during index construction via C++ extension
+                                </p>
+                            </div>
+
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                                <StatCell
+                                    label="Edge Reduction"
+                                    value={`${(data.tahnsw.stats.edge_reduction_pct ?? 0).toFixed(1)}%`}
+                                    color="var(--success)"
+                                    hint="fewer edges vs fixed-M HNSW"
+                                />
+                                <StatCell
+                                    label="Mean M_eff"
+                                    value={(data.tahnsw.stats.mean_M_eff ?? 0).toFixed(1)}
+                                    color="var(--primary)"
+                                    hint={`base M = 16, inflated to ${Math.round(16 * 1.5) + 2}`}
+                                />
+                                <StatCell
+                                    label="Hub Nodes"
+                                    value={`${(data.tahnsw.stats.hub_pct ?? 0).toFixed(1)}%`}
+                                    color="var(--accent)"
+                                    hint="low C(v), promoted to upper layers"
+                                />
+                                <StatCell
+                                    label="Leaf Nodes"
+                                    value={`${(data.tahnsw.stats.leaf_pct ?? 0).toFixed(1)}%`}
+                                    color="var(--primary)"
+                                    hint="high C(v), layer 0 only"
+                                />
+                                <StatCell
+                                    label="Normal Nodes"
+                                    value={`${(data.tahnsw.stats.normal_pct ?? 0).toFixed(1)}%`}
+                                    color="var(--text)"
+                                    hint="standard layer assignment"
+                                />
+                                <StatCell
+                                    label="Search Recall (max)"
+                                    value={(recallAtHighEfTahnsw * 100).toFixed(1) + "%"}
+                                    color="var(--primary)"
+                                    hint={`at ef=${data.tahnsw.curve[data.tahnsw.curve.length - 1]?.ef ?? "?"}`}
+                                />
+                            </div>
+
+                            {/* Edge reduction explanation */}
+                            <div style={{
+                                marginTop: 16, padding: "14px 18px",
+                                background: "var(--surface-2)", borderRadius: 10,
+                                borderLeft: "3px solid var(--success)",
+                            }}>
+                                <p style={{ fontSize: "0.8rem", color: "var(--text)", lineHeight: 1.7, margin: 0 }}>
+                                    <strong style={{ color: "var(--success)" }}>
+                                        {(data.tahnsw.stats.edge_reduction_pct ?? 0).toFixed(1)}% edge reduction
+                                    </strong>
+                                    {" "}means TAHNSW uses significantly fewer edges than a fixed-M HNSW while maintaining comparable recall.
+                                    This is achieved through: (1) <strong style={{ color: "var(--text)" }}>adaptive M(v)</strong> — hub nodes get more edges, leaf nodes get fewer;
+                                    (2) <strong style={{ color: "var(--text)" }}>RNG pruning</strong> — dominated edges at layer 0 are removed;
+                                    (3) <strong style={{ color: "var(--text)" }}>topology-aware layer assignment</strong> — nodes are placed in layers based on their clustering coefficient C(v).
+                                </p>
+                            </div>
+                        </div>
+
+                    </div>
+                )}
+            </motion.div>
+        </div>
+    );
+}

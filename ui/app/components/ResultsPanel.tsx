@@ -174,7 +174,7 @@ export default function ResultsPanel({ hnsw, tahnsw, loading, query }: Props) {
             {/* Side-by-side columns */}
             <div style={{ display: "flex", gap: 16 }}>
                 <Column label="HNSW (Traditional)" color="var(--hnsw)" result={hnsw} loading={loading} />
-                <Column label="TAHNSW (Ours)" color="var(--primary)" result={tahnsw} loading={loading} />
+                <Column label="TAHNSW (C++)" color="var(--primary)" result={tahnsw} loading={loading} />
             </div>
         </motion.div>
     );

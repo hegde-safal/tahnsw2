@@ -178,8 +178,8 @@ export default function Home() {
           transition={{ duration: 0.5, delay: 0.25 }}
           style={{ color: "var(--text-muted)", fontSize: "1rem", maxWidth: 560, lineHeight: 1.7, position: "relative", zIndex: 1 }}
         >
-          A live comparison of <strong style={{ color: "var(--text)" }}>TAHNSW</strong> vs standard{" "}
-          <strong style={{ color: "var(--hnsw)" }}>HNSW</strong> — search 200 movies and see
+          A live comparison of <strong style={{ color: "var(--primary)" }}>TAHNSW (C++)</strong> vs standard{" "}
+          <strong style={{ color: "var(--hnsw)" }}>HNSW</strong> — search 5,000 movies and see
           how topology-aware indexing changes the results and speed.
         </motion.p>
 
